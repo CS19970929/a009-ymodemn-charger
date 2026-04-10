@@ -21,6 +21,8 @@
 #define PACKET_128 128
 #define PACKET_1K 1024
 
+#define INITIAL_RECEIVER_TIMEOUT_MS 20000
+
 static void set_error(WCHAR *error, size_t count, const WCHAR *format, ...) {
     va_list args;
     va_start(args, format);
@@ -303,8 +305,11 @@ BOOL ymodem_send_file(HANDLE serial,
     }
 
     log_text(log_fn, user, L"等待充电器进入 YMODEM 接收状态...");
-    response = wait_control_response(serial, 60000, TRUE, stop_flag, error, error_count);
+    response = wait_control_response(serial, INITIAL_RECEIVER_TIMEOUT_MS, TRUE, stop_flag, error, error_count);
     if (response <= 0) {
+        if (response == 0) {
+            set_error(error, error_count, L"发送 update 后未进入 YMODEM 接收状态，请检查设备是否在 7 秒窗口内收到命令");
+        }
         CloseHandle(file);
         return FALSE;
     }

@@ -28,6 +28,8 @@
 #define WM_APP_DONE (WM_APP + 4)
 #define WM_APP_ERROR (WM_APP + 5)
 
+#define BOOT_TEXT_BUFFER_BYTES 8192
+
 static HINSTANCE g_instance = NULL;
 static HWND g_main = NULL;
 static HWND g_port_combo = NULL;
@@ -41,11 +43,14 @@ static HWND g_info = NULL;
 static HANDLE g_serial = INVALID_HANDLE_VALUE;
 static HANDLE g_worker = NULL;
 static volatile LONG g_stop_worker = 0;
+static WCHAR g_firmware_path[MAX_PATH] = L"";
 
 struct WorkerContext {
     HANDLE serial;
     WCHAR firmware_path[MAX_PATH];
 };
+
+static void stop_worker_if_needed(void);
 
 static void set_control_font(HWND hwnd) {
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
@@ -156,6 +161,16 @@ static BOOL get_selected_port(WCHAR *port, size_t count) {
     return port[0] != L'\0';
 }
 
+static BOOL firmware_file_exists(const WCHAR *path) {
+    DWORD attrs;
+
+    if (!path || path[0] == L'\0') {
+        return FALSE;
+    }
+    attrs = GetFileAttributesW(path);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
 static BOOL open_serial_port(const WCHAR *port, HANDLE *serial_out, WCHAR *error, size_t error_count) {
     WCHAR device[64];
     HANDLE handle;
@@ -262,37 +277,91 @@ static void worker_progress(void *user, DWORD percent) {
     PostMessageW(g_main, WM_APP_PROGRESS, (WPARAM)percent, 0);
 }
 
-static void decode_and_log_boot_output(const BYTE *data, DWORD length) {
+static BOOL decode_serial_text(const BYTE *data, DWORD length, WCHAR *text, size_t text_count) {
     int chars;
-    WCHAR *text;
 
-    if (length == 0) {
-        return;
+    if (length == 0 || text_count == 0) {
+        return FALSE;
     }
 
     chars = MultiByteToWideChar(936, 0, (const char *)data, (int)length, NULL, 0);
     if (chars <= 0) {
         chars = MultiByteToWideChar(CP_ACP, 0, (const char *)data, (int)length, NULL, 0);
     }
-    if (chars <= 0) {
-        post_logf(L"已检测到充电器串口输出");
-        return;
+    if (chars <= 0 || (size_t)chars >= text_count) {
+        return FALSE;
     }
 
-    text = (WCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (chars + 1) * sizeof(WCHAR));
-    if (!text) {
-        return;
-    }
     if (MultiByteToWideChar(936, 0, (const char *)data, (int)length, text, chars) <= 0) {
-        MultiByteToWideChar(CP_ACP, 0, (const char *)data, (int)length, text, chars);
+        if (MultiByteToWideChar(CP_ACP, 0, (const char *)data, (int)length, text, chars) <= 0) {
+            return FALSE;
+        }
     }
-    post_logf(L"充电器输出: %s", text);
-    HeapFree(GetProcessHeap(), 0, text);
+    text[chars] = L'\0';
+    return TRUE;
 }
 
-static BOOL wait_for_boot_output(HANDLE serial, WCHAR *error, size_t error_count) {
-    BYTE buffer[4096];
+static void log_new_serial_text(const BYTE *data, DWORD length, size_t *logged_chars) {
+    WCHAR text[4096];
+    size_t total_chars;
+
+    if (!logged_chars) {
+        return;
+    }
+    if (!decode_serial_text(data, length, text, ARRAYSIZE(text))) {
+        return;
+    }
+
+    total_chars = wcslen(text);
+    if (*logged_chars > total_chars) {
+        *logged_chars = 0;
+    }
+    if (total_chars > *logged_chars && text[*logged_chars] != L'\0') {
+        post_logf(L"串口输出: %s", text + *logged_chars);
+        *logged_chars = total_chars;
+    }
+}
+
+static BOOL append_boot_bytes(BYTE *buffer, DWORD *total, const BYTE *chunk, DWORD chunk_size) {
+    DWORD keep;
+
+    if (chunk_size >= BOOT_TEXT_BUFFER_BYTES) {
+        CopyMemory(buffer, chunk + (chunk_size - BOOT_TEXT_BUFFER_BYTES), BOOT_TEXT_BUFFER_BYTES);
+        *total = BOOT_TEXT_BUFFER_BYTES;
+        return TRUE;
+    }
+
+    if (*total + chunk_size <= BOOT_TEXT_BUFFER_BYTES) {
+        CopyMemory(buffer + *total, chunk, chunk_size);
+        *total += chunk_size;
+        return TRUE;
+    }
+
+    keep = BOOT_TEXT_BUFFER_BYTES - chunk_size;
+    MoveMemory(buffer, buffer + (*total - keep), keep);
+    CopyMemory(buffer + keep, chunk, chunk_size);
+    *total = BOOT_TEXT_BUFFER_BYTES;
+    return TRUE;
+}
+
+static BOOL text_contains_update_prompt(const WCHAR *text) {
+    return wcsstr(text, L"update") != NULL &&
+           wcsstr(text, L"开始升级程序") != NULL;
+}
+
+static BOOL text_contains_boot_timeout_text(const WCHAR *text) {
+    return wcsstr(text, L"开始加载内部FLASH程序") != NULL;
+}
+
+static BOOL text_contains_wait_file_prompt(const WCHAR *text) {
+    return wcsstr(text, L"等待文件发送") != NULL;
+}
+
+static BOOL wait_for_boot_prompt(HANDLE serial, WCHAR *error, size_t error_count) {
+    BYTE buffer[BOOT_TEXT_BUFFER_BYTES];
     DWORD total = 0;
+    WCHAR text[4096];
+    size_t logged_chars = 0;
 
     while (InterlockedCompareExchange(&g_stop_worker, 0, 0) == 0) {
         BYTE chunk[256];
@@ -308,26 +377,68 @@ static BOOL wait_for_boot_output(HANDLE serial, WCHAR *error, size_t error_count
             continue;
         }
 
-        if (read_count > sizeof(buffer)) {
-            read_count = sizeof(buffer);
+        append_boot_bytes(buffer, &total, chunk, read_count);
+        if (!decode_serial_text(buffer, total, text, ARRAYSIZE(text))) {
+            continue;
         }
-        CopyMemory(buffer, chunk, read_count);
-        total = read_count;
+        log_new_serial_text(buffer, total, &logged_chars);
 
-        Sleep(200);
-        while (total < sizeof(buffer)) {
-            DWORD more = 0;
-            if (!ReadFile(serial, buffer + total, sizeof(buffer) - total, &more, NULL)) {
-                break;
-            }
-            if (more == 0) {
-                break;
-            }
-            total += more;
+        if (text_contains_update_prompt(text)) {
+            post_logf(L"已识别到升级提示，将在 7 秒窗口内自动发送 update");
+            return TRUE;
         }
 
-        decode_and_log_boot_output(buffer, total);
-        return TRUE;
+        if (text_contains_boot_timeout_text(text)) {
+            set_error(error, error_count, L"设备已开始加载内部 FLASH 程序，说明 7 秒升级窗口已错过");
+            return FALSE;
+        }
+    }
+
+    set_error(error, error_count, L"下载任务已取消");
+    return FALSE;
+}
+
+static BOOL wait_for_file_send_prompt(HANDLE serial, WCHAR *error, size_t error_count) {
+    BYTE buffer[BOOT_TEXT_BUFFER_BYTES];
+    DWORD total = 0;
+    DWORD start = GetTickCount();
+    WCHAR text[4096];
+    size_t logged_chars = 0;
+
+    while (InterlockedCompareExchange(&g_stop_worker, 0, 0) == 0) {
+        BYTE chunk[256];
+        DWORD read_count = 0;
+
+        if (GetTickCount() - start >= 15000) {
+            set_error(error, error_count, L"已发送 update，但未收到“等待文件发送”提示");
+            return FALSE;
+        }
+
+        if (!ReadFile(serial, chunk, sizeof(chunk), &read_count, NULL)) {
+            WCHAR win_error[256];
+            format_win_error(GetLastError(), win_error, ARRAYSIZE(win_error));
+            set_error(error, error_count, L"串口读取失败：%s", win_error);
+            return FALSE;
+        }
+        if (read_count == 0) {
+            continue;
+        }
+
+        append_boot_bytes(buffer, &total, chunk, read_count);
+        if (!decode_serial_text(buffer, total, text, ARRAYSIZE(text))) {
+            continue;
+        }
+        log_new_serial_text(buffer, total, &logged_chars);
+
+        if (text_contains_wait_file_prompt(text)) {
+            post_logf(L"已识别到“等待文件发送”提示，准备进入 YMODEM 发送");
+            return TRUE;
+        }
+
+        if (text_contains_boot_timeout_text(text)) {
+            set_error(error, error_count, L"设备已经开始加载内部 FLASH 程序，update 未生效");
+            return FALSE;
+        }
     }
 
     set_error(error, error_count, L"下载任务已取消");
@@ -338,29 +449,52 @@ static DWORD WINAPI upgrade_thread_proc(LPVOID param) {
     WorkerContext *context = (WorkerContext *)param;
     WCHAR error[512];
     const BYTE update_command[] = {'u', 'p', 'd', 'a', 't', 'e', '\r', '\n'};
-    BOOL ok;
+    BOOL ok = TRUE;
 
     error[0] = L'\0';
-    PurgeComm(context->serial, PURGE_RXCLEAR | PURGE_TXCLEAR);
 
-    post_status(L"等待充电器上电...");
-    post_logf(L"等待充电器上电串口输出");
-    ok = wait_for_boot_output(context->serial, error, ARRAYSIZE(error));
+    while (InterlockedCompareExchange(&g_stop_worker, 0, 0) == 0) {
+        PostMessageW(g_main, WM_APP_PROGRESS, 0, 0);
+        PurgeComm(context->serial, PURGE_RXCLEAR | PURGE_TXCLEAR);
 
-    if (ok) {
+        post_status(L"等待充电器上电...");
+        post_logf(L"批量待机中，等待充电器上电并识别 Bootloader 的 update 提示");
+        ok = wait_for_boot_prompt(context->serial, error, ARRAYSIZE(error));
+        if (!ok) {
+            break;
+        }
+
         post_status(L"已检测到充电器，发送 update...");
         post_logf(L"发送命令: update");
         ok = write_all(context->serial, update_command, sizeof(update_command), error, ARRAYSIZE(error));
-    }
+        if (!ok) {
+            break;
+        }
 
-    if (ok) {
+        post_status(L"等待设备进入文件接收状态...");
+        ok = wait_for_file_send_prompt(context->serial, error, ARRAYSIZE(error));
+        if (!ok) {
+            break;
+        }
+
+        post_status(L"设备已进入文件接收状态，等待 YMODEM 握手...");
         ok = ymodem_send_file(context->serial, context->firmware_path, &g_stop_worker,
                               worker_log, worker_progress, NULL, error, ARRAYSIZE(error));
+        if (!ok) {
+            break;
+        }
+
+        PostMessageW(g_main, WM_APP_DONE, 1, 0);
+        post_status(L"当前设备升级完成，继续等待下一台上电...");
+        post_logf(L"当前设备升级完成，当前固件不变，继续等待下一台上电");
     }
 
-    if (ok) {
-        PostMessageW(g_main, WM_APP_DONE, 1, 0);
-    } else {
+    if (InterlockedCompareExchange(&g_stop_worker, 0, 0) != 0) {
+        HeapFree(GetProcessHeap(), 0, context);
+        return 0;
+    }
+
+    if (!ok) {
         WCHAR *copy = heap_copy_text(error[0] ? error : L"升级失败");
         PostMessageW(g_main, WM_APP_ERROR, 0, (LPARAM)copy);
     }
@@ -393,17 +527,18 @@ static void connect_or_disconnect(void) {
         SetWindowTextW(g_status, L"已连接");
         append_log(L"串口已连接，参数 115200 / 8N1");
     } else {
+        stop_worker_if_needed();
         close_serial_port();
+        ZeroMemory(g_firmware_path, sizeof(g_firmware_path));
         set_connected_ui(FALSE);
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SetWindowTextW(g_status, L"未连接");
-        append_log(L"串口已断开");
+        append_log(L"串口已断开，已退出批量待机模式");
     }
 }
 
 static void start_download(void) {
     OPENFILENAMEW ofn;
-    WCHAR file_path[MAX_PATH];
     WorkerContext *context;
     DWORD thread_id;
 
@@ -416,17 +551,19 @@ static void start_download(void) {
         return;
     }
 
-    ZeroMemory(file_path, sizeof(file_path));
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = g_main;
-    ofn.lpstrFilter = L"固件文件 (*.bin)\0*.bin\0所有文件 (*.*)\0*.*\0";
-    ofn.lpstrFile = file_path;
-    ofn.nMaxFile = ARRAYSIZE(file_path);
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    ofn.lpstrTitle = L"选择充电器固件";
-    if (!GetOpenFileNameW(&ofn)) {
-        return;
+    if (!firmware_file_exists(g_firmware_path)) {
+        ZeroMemory(g_firmware_path, sizeof(g_firmware_path));
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_main;
+        ofn.lpstrFilter = L"固件文件 (*.bin)\0*.bin\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFile = g_firmware_path;
+        ofn.nMaxFile = ARRAYSIZE(g_firmware_path);
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+        ofn.lpstrTitle = L"选择充电器固件";
+        if (!GetOpenFileNameW(&ofn)) {
+            return;
+        }
     }
 
     context = (WorkerContext *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WorkerContext));
@@ -435,7 +572,7 @@ static void start_download(void) {
         return;
     }
     context->serial = g_serial;
-    StringCchCopyW(context->firmware_path, ARRAYSIZE(context->firmware_path), file_path);
+    StringCchCopyW(context->firmware_path, ARRAYSIZE(context->firmware_path), g_firmware_path);
 
     InterlockedExchange(&g_stop_worker, 0);
     g_worker = CreateThread(NULL, 0, upgrade_thread_proc, context, 0, &thread_id);
@@ -446,10 +583,11 @@ static void start_download(void) {
     }
 
     EnableWindow(g_download_button, FALSE);
-    EnableWindow(g_connect_button, FALSE);
     SendMessageW(g_progress, PBM_SETPOS, 0, 0);
     SetWindowTextW(g_status, L"等待充电器上电...");
-    append_log(L"已选择固件，等待充电器上电");
+    append_log(L"已进入批量待机模式");
+    post_logf(L"当前固件: %s", g_firmware_path);
+    append_log(L"请保持串口连接，后续同一固件批量设备上电后会自动进入升级流程");
 }
 
 static void layout_controls(HWND hwnd) {
@@ -560,14 +698,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
         return 0;
 
     case WM_APP_DONE:
-        if (g_worker) {
-            CloseHandle(g_worker);
-            g_worker = NULL;
-        }
-        EnableWindow(g_download_button, TRUE);
-        EnableWindow(g_connect_button, TRUE);
-        SetWindowTextW(g_status, L"升级完成");
-        append_log(L"升级完成");
+        append_log(L"当前设备升级完成");
         return 0;
 
     case WM_APP_ERROR:
@@ -576,7 +707,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
             g_worker = NULL;
         }
         EnableWindow(g_download_button, TRUE);
-        EnableWindow(g_connect_button, TRUE);
         SetWindowTextW(g_status, L"升级失败");
         append_log((const WCHAR *)lparam);
         MessageBoxW(hwnd, (const WCHAR *)lparam, L"升级失败", MB_ICONERROR);
