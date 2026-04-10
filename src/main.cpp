@@ -29,6 +29,9 @@
 #define WM_APP_ERROR (WM_APP + 5)
 
 #define BOOT_TEXT_BUFFER_BYTES 8192
+#define SERIAL_IDLE_RESET_MS 1200
+#define POST_UPGRADE_DRAIN_IDLE_MS 1000
+#define POST_UPGRADE_DRAIN_MAX_MS 5000
 
 static HINSTANCE g_instance = NULL;
 static HWND g_main = NULL;
@@ -357,11 +360,38 @@ static BOOL text_contains_wait_file_prompt(const WCHAR *text) {
     return wcsstr(text, L"等待文件发送") != NULL;
 }
 
+static void reset_capture_buffer(DWORD *total, size_t *logged_chars) {
+    if (total) {
+        *total = 0;
+    }
+    if (logged_chars) {
+        *logged_chars = 0;
+    }
+}
+
+static BOOL tail_contains_receiver_request(const BYTE *buffer, DWORD total) {
+    DWORD i;
+
+    if (total == 0) {
+        return FALSE;
+    }
+
+    for (i = total; i > 0; --i) {
+        BYTE value = buffer[i - 1];
+        if (value == '\r' || value == '\n' || value == ' ' || value == '\t') {
+            continue;
+        }
+        return value == 'C';
+    }
+    return FALSE;
+}
+
 static BOOL wait_for_boot_prompt(HANDLE serial, WCHAR *error, size_t error_count) {
     BYTE buffer[BOOT_TEXT_BUFFER_BYTES];
     DWORD total = 0;
     WCHAR text[4096];
     size_t logged_chars = 0;
+    DWORD last_data_tick = GetTickCount();
 
     while (InterlockedCompareExchange(&g_stop_worker, 0, 0) == 0) {
         BYTE chunk[256];
@@ -374,9 +404,14 @@ static BOOL wait_for_boot_prompt(HANDLE serial, WCHAR *error, size_t error_count
             return FALSE;
         }
         if (read_count == 0) {
+            if (total > 0 && GetTickCount() - last_data_tick >= SERIAL_IDLE_RESET_MS) {
+                reset_capture_buffer(&total, &logged_chars);
+                post_logf(L"串口已静默，继续等待下一台设备上电");
+            }
             continue;
         }
 
+        last_data_tick = GetTickCount();
         append_boot_bytes(buffer, &total, chunk, read_count);
         if (!decode_serial_text(buffer, total, text, ARRAYSIZE(text))) {
             continue;
@@ -404,6 +439,7 @@ static BOOL wait_for_file_send_prompt(HANDLE serial, WCHAR *error, size_t error_
     DWORD start = GetTickCount();
     WCHAR text[4096];
     size_t logged_chars = 0;
+    DWORD last_data_tick = GetTickCount();
 
     while (InterlockedCompareExchange(&g_stop_worker, 0, 0) == 0) {
         BYTE chunk[256];
@@ -421,16 +457,24 @@ static BOOL wait_for_file_send_prompt(HANDLE serial, WCHAR *error, size_t error_
             return FALSE;
         }
         if (read_count == 0) {
+            if (total > 0 && GetTickCount() - last_data_tick >= SERIAL_IDLE_RESET_MS) {
+                reset_capture_buffer(&total, &logged_chars);
+            }
             continue;
         }
 
+        last_data_tick = GetTickCount();
         append_boot_bytes(buffer, &total, chunk, read_count);
         if (!decode_serial_text(buffer, total, text, ARRAYSIZE(text))) {
+            if (tail_contains_receiver_request(buffer, total)) {
+                post_logf(L"已检测到 YMODEM 握手字符 C，准备进入 YMODEM 发送");
+                return TRUE;
+            }
             continue;
         }
         log_new_serial_text(buffer, total, &logged_chars);
 
-        if (text_contains_wait_file_prompt(text)) {
+        if (text_contains_wait_file_prompt(text) || tail_contains_receiver_request(buffer, total)) {
             post_logf(L"已识别到“等待文件发送”提示，准备进入 YMODEM 发送");
             return TRUE;
         }
@@ -439,6 +483,43 @@ static BOOL wait_for_file_send_prompt(HANDLE serial, WCHAR *error, size_t error_
             set_error(error, error_count, L"设备已经开始加载内部 FLASH 程序，update 未生效");
             return FALSE;
         }
+    }
+
+    set_error(error, error_count, L"下载任务已取消");
+    return FALSE;
+}
+
+static BOOL drain_post_upgrade_output(HANDLE serial, WCHAR *error, size_t error_count) {
+    BYTE buffer[BOOT_TEXT_BUFFER_BYTES];
+    DWORD total = 0;
+    DWORD start = GetTickCount();
+    DWORD last_data_tick = GetTickCount();
+    size_t logged_chars = 0;
+
+    while (InterlockedCompareExchange(&g_stop_worker, 0, 0) == 0) {
+        BYTE chunk[256];
+        DWORD read_count = 0;
+
+        if (total > 0 && GetTickCount() - last_data_tick >= POST_UPGRADE_DRAIN_IDLE_MS) {
+            return TRUE;
+        }
+        if (GetTickCount() - start >= POST_UPGRADE_DRAIN_MAX_MS) {
+            return TRUE;
+        }
+
+        if (!ReadFile(serial, chunk, sizeof(chunk), &read_count, NULL)) {
+            WCHAR win_error[256];
+            format_win_error(GetLastError(), win_error, ARRAYSIZE(win_error));
+            set_error(error, error_count, L"串口读取失败：%s", win_error);
+            return FALSE;
+        }
+        if (read_count == 0) {
+            continue;
+        }
+
+        last_data_tick = GetTickCount();
+        append_boot_bytes(buffer, &total, chunk, read_count);
+        log_new_serial_text(buffer, total, &logged_chars);
     }
 
     set_error(error, error_count, L"下载任务已取消");
@@ -487,6 +568,10 @@ static DWORD WINAPI upgrade_thread_proc(LPVOID param) {
         PostMessageW(g_main, WM_APP_DONE, 1, 0);
         post_status(L"当前设备升级完成，继续等待下一台上电...");
         post_logf(L"当前设备升级完成，当前固件不变，继续等待下一台上电");
+        ok = drain_post_upgrade_output(context->serial, error, ARRAYSIZE(error));
+        if (!ok) {
+            break;
+        }
     }
 
     if (InterlockedCompareExchange(&g_stop_worker, 0, 0) != 0) {
