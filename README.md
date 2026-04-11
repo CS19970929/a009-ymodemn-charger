@@ -19,13 +19,17 @@
 
 ## 直接运行
 
-当前仓库已生成可直接运行的 32 位 Windows 程序：
+当前仓库提供两个 32 位 Windows 程序：
 
 ```text
-release\ChargerUpdater.exe
+release\ChargerUpdater_debug.exe
+release\ChargerUpdater_user.exe
 ```
 
-最终用户只需要这个 exe，不需要安装 Python、.NET、pyserial 或 SecureCRT。
+- `ChargerUpdater_debug.exe`：保留完整调试日志，适合联调和现场排查
+- `ChargerUpdater_user.exe`：面向普通操作员，界面更简化，只强调连接、待机、升级中、升级成功
+
+最终用户只需要对应的 exe，不需要安装 Python、.NET、pyserial 或 SecureCRT。
 
 ## 重新生成 exe
 
@@ -40,7 +44,8 @@ build_mingw32.bat
 脚本会优先使用 `C:\qp\qtools\MinGW32\bin\g++.exe`，如果不存在则使用 `PATH` 中的 `g++`。输出文件：
 
 ```text
-build\ChargerUpdater.exe
+release\ChargerUpdater_debug.exe
+release\ChargerUpdater_user.exe
 ```
 
 ## 使用步骤

@@ -9,3 +9,5 @@ build/
 .mypy_cache/
 *.o
 *.obj
+release/ChargerUpdater_new.exe
+release/ChargerUpdater_batch_debug.exe

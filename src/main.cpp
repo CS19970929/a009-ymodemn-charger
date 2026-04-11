@@ -11,7 +11,11 @@
 
 #include "ymodem.h"
 
+#ifdef SIMPLE_UI
 #define APP_TITLE L"充电器升级工具"
+#else
+#define APP_TITLE L"充电器升级工具（调试版）"
+#endif
 #define BAUDRATE 115200
 
 #define IDC_PORT_COMBO 1001
@@ -40,8 +44,18 @@ static HWND g_connect_button = NULL;
 static HWND g_download_button = NULL;
 static HWND g_progress = NULL;
 static HWND g_status = NULL;
+#ifndef SIMPLE_UI
 static HWND g_log = NULL;
+#endif
 static HWND g_info = NULL;
+#ifdef SIMPLE_UI
+static HWND g_tip = NULL;
+static HWND g_counter = NULL;
+static HFONT g_status_font = NULL;
+static HFONT g_tip_font = NULL;
+static COLORREF g_status_color = RGB(51, 51, 51);
+static unsigned int g_success_count = 0;
+#endif
 
 static HANDLE g_serial = INVALID_HANDLE_VALUE;
 static HANDLE g_worker = NULL;
@@ -54,6 +68,22 @@ struct WorkerContext {
 };
 
 static void stop_worker_if_needed(void);
+
+#ifdef SIMPLE_UI
+static const WCHAR *base_name_of(const WCHAR *path) {
+    const WCHAR *last_slash = wcsrchr(path, L'\\');
+    const WCHAR *last_forward = wcsrchr(path, L'/');
+    const WCHAR *base = path;
+
+    if (last_slash && last_slash + 1 > base) {
+        base = last_slash + 1;
+    }
+    if (last_forward && last_forward + 1 > base) {
+        base = last_forward + 1;
+    }
+    return base;
+}
+#endif
 
 static void set_control_font(HWND hwnd) {
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
@@ -96,6 +126,23 @@ static void post_status(const WCHAR *text) {
 }
 
 static void append_log(const WCHAR *text) {
+#ifdef SIMPLE_UI
+    if (!text) {
+        return;
+    }
+    if (wcsstr(text, L"当前固件:") != NULL) {
+        SetWindowTextW(g_info, text);
+        return;
+    }
+    if (wcsstr(text, L"串口已连接") != NULL ||
+        wcsstr(text, L"批量待机") != NULL ||
+        wcsstr(text, L"请保持串口连接") != NULL ||
+        wcsstr(text, L"当前设备升级完成") != NULL ||
+        wcsstr(text, L"升级失败") != NULL) {
+        SetWindowTextW(g_tip, text);
+    }
+    return;
+#else
     SYSTEMTIME st;
     WCHAR line[1600];
     int len;
@@ -107,7 +154,48 @@ static void append_log(const WCHAR *text) {
     SendMessageW(g_log, EM_SETSEL, len, len);
     SendMessageW(g_log, EM_REPLACESEL, FALSE, (LPARAM)line);
     SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
+#endif
 }
+
+#ifdef SIMPLE_UI
+static void update_success_counter(void) {
+    WCHAR text[64];
+    StringCchPrintfW(text, ARRAYSIZE(text), L"已成功升级 %u 台", g_success_count);
+    SetWindowTextW(g_counter, text);
+}
+
+static void set_simple_status(const WCHAR *title, COLORREF color, const WCHAR *tip) {
+    g_status_color = color;
+    SetWindowTextW(g_status, title);
+    if (tip && g_tip) {
+        SetWindowTextW(g_tip, tip);
+    }
+    InvalidateRect(g_status, NULL, TRUE);
+}
+
+static void apply_status_message(const WCHAR *message) {
+    if (!message) {
+        return;
+    }
+
+    if (wcsstr(message, L"等待充电器上电") != NULL) {
+        set_simple_status(L"请给充电器上电", RGB(210, 130, 0), L"检测到上电后会自动升级");
+    } else if (wcsstr(message, L"已检测到充电器") != NULL ||
+               wcsstr(message, L"等待设备进入文件接收状态") != NULL ||
+               wcsstr(message, L"等待 YMODEM 握手") != NULL) {
+        set_simple_status(L"正在升级", RGB(0, 102, 204), L"升级过程中请勿断电");
+    } else if (wcsstr(message, L"当前设备升级完成") != NULL ||
+               wcsstr(message, L"升级完成") != NULL) {
+        set_simple_status(L"升级成功", RGB(0, 140, 70), L"请更换下一台充电器");
+    } else if (wcsstr(message, L"升级失败") != NULL) {
+        set_simple_status(L"升级失败", RGB(200, 30, 30), L"请检查设备后重新开始");
+    } else if (wcsstr(message, L"已连接") != NULL) {
+        set_simple_status(L"请点击下载", RGB(51, 51, 51), L"固件选好后将进入批量待机");
+    } else if (wcsstr(message, L"未连接") != NULL) {
+        set_simple_status(L"请先连接串口", RGB(51, 51, 51), L"选择 COM 口后点击连接");
+    }
+}
+#endif
 
 static void format_win_error(DWORD error_code, WCHAR *buffer, size_t count) {
     DWORD written = FormatMessageW(
@@ -610,6 +698,9 @@ static void connect_or_disconnect(void) {
         set_connected_ui(TRUE);
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SetWindowTextW(g_status, L"已连接");
+#ifdef SIMPLE_UI
+        apply_status_message(L"已连接");
+#endif
         append_log(L"串口已连接，参数 115200 / 8N1");
     } else {
         stop_worker_if_needed();
@@ -618,6 +709,12 @@ static void connect_or_disconnect(void) {
         set_connected_ui(FALSE);
         SendMessageW(g_progress, PBM_SETPOS, 0, 0);
         SetWindowTextW(g_status, L"未连接");
+#ifdef SIMPLE_UI
+        SetWindowTextW(g_info, L"固件：未选择");
+        g_success_count = 0;
+        update_success_counter();
+        apply_status_message(L"未连接");
+#endif
         append_log(L"串口已断开，已退出批量待机模式");
     }
 }
@@ -670,6 +767,16 @@ static void start_download(void) {
     EnableWindow(g_download_button, FALSE);
     SendMessageW(g_progress, PBM_SETPOS, 0, 0);
     SetWindowTextW(g_status, L"等待充电器上电...");
+#ifdef SIMPLE_UI
+    g_success_count = 0;
+    update_success_counter();
+    {
+        WCHAR firmware_text[MAX_PATH + 16];
+        StringCchPrintfW(firmware_text, ARRAYSIZE(firmware_text), L"固件：%s", base_name_of(g_firmware_path));
+        SetWindowTextW(g_info, firmware_text);
+    }
+    apply_status_message(L"等待充电器上电");
+#endif
     append_log(L"已进入批量待机模式");
     post_logf(L"当前固件: %s", g_firmware_path);
     append_log(L"请保持串口连接，后续同一固件批量设备上电后会自动进入升级流程");
@@ -678,29 +785,50 @@ static void start_download(void) {
 static void layout_controls(HWND hwnd) {
     RECT rc;
     int width;
+#ifndef SIMPLE_UI
     int height;
+#endif
     int margin = 14;
+#ifndef SIMPLE_UI
     int top = 14;
     int combo_w = 150;
     int button_w = 86;
     int row_h = 26;
+#else
+    int top = 16;
+    int combo_w = 150;
+    int button_w = 86;
+    int row_h = 28;
+#endif
 
     GetClientRect(hwnd, &rc);
     width = rc.right - rc.left;
+#ifndef SIMPLE_UI
     height = rc.bottom - rc.top;
+#endif
 
     MoveWindow(g_port_combo, margin, top, combo_w, 300, TRUE);
     MoveWindow(g_connect_button, margin + combo_w + 10, top, button_w, row_h, TRUE);
     MoveWindow(g_download_button, margin + combo_w + 10 + button_w + 8, top, button_w, row_h, TRUE);
+#ifndef SIMPLE_UI
     MoveWindow(g_info, width - 210, top + 4, 196, row_h, TRUE);
     MoveWindow(g_progress, margin, 54, width - margin * 2, 20, TRUE);
     MoveWindow(g_status, margin, 82, width - margin * 2, 22, TRUE);
     MoveWindow(g_log, margin, 112, width - margin * 2, height - 126, TRUE);
+#else
+    MoveWindow(g_info, margin, 56, width - margin * 2, 20, TRUE);
+    MoveWindow(g_status, margin, 96, width - margin * 2, 90, TRUE);
+    MoveWindow(g_progress, margin + 24, 206, width - (margin + 24) * 2, 24, TRUE);
+    MoveWindow(g_tip, margin, 248, width - margin * 2, 24, TRUE);
+    MoveWindow(g_counter, margin, 282, width - margin * 2, 24, TRUE);
+#endif
 }
 
 static void create_controls(HWND hwnd) {
+#ifndef SIMPLE_UI
     DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
                        ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY;
+#endif
 
     g_port_combo = CreateWindowExW(0, WC_COMBOBOXW, NULL,
                                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL,
@@ -711,6 +839,7 @@ static void create_controls(HWND hwnd) {
     g_download_button = CreateWindowExW(0, WC_BUTTONW, L"下载",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
                                         0, 0, 0, 0, hwnd, (HMENU)IDC_DOWNLOAD_BUTTON, g_instance, NULL);
+#ifndef SIMPLE_UI
     g_progress = CreateWindowExW(0, PROGRESS_CLASSW, NULL,
                                  WS_CHILD | WS_VISIBLE,
                                  0, 0, 0, 0, hwnd, (HMENU)IDC_PROGRESS, g_instance, NULL);
@@ -723,17 +852,61 @@ static void create_controls(HWND hwnd) {
     g_log = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, NULL,
                             edit_style,
                             0, 0, 0, 0, hwnd, (HMENU)IDC_LOG, g_instance, NULL);
+#else
+    g_info = CreateWindowExW(0, WC_STATICW, L"固件：未选择",
+                             WS_CHILD | WS_VISIBLE,
+                             0, 0, 0, 0, hwnd, (HMENU)IDC_INFO, g_instance, NULL);
+    g_status = CreateWindowExW(0, WC_STATICW, L"请先连接串口",
+                               WS_CHILD | WS_VISIBLE | SS_CENTER,
+                               0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, g_instance, NULL);
+    g_progress = CreateWindowExW(0, PROGRESS_CLASSW, NULL,
+                                 WS_CHILD | WS_VISIBLE,
+                                 0, 0, 0, 0, hwnd, (HMENU)IDC_PROGRESS, g_instance, NULL);
+    g_tip = CreateWindowExW(0, WC_STATICW, L"选择 COM 口后点击连接",
+                            WS_CHILD | WS_VISIBLE | SS_CENTER,
+                            0, 0, 0, 0, hwnd, NULL, g_instance, NULL);
+    g_counter = CreateWindowExW(0, WC_STATICW, L"已成功升级 0 台",
+                                WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                0, 0, 0, 0, hwnd, NULL, g_instance, NULL);
+#endif
 
     set_control_font(g_port_combo);
     set_control_font(g_connect_button);
     set_control_font(g_download_button);
     set_control_font(g_status);
     set_control_font(g_info);
+#ifndef SIMPLE_UI
     set_control_font(g_log);
+#else
+    set_control_font(g_tip);
+    set_control_font(g_counter);
+    {
+        LOGFONTW lf;
+        ZeroMemory(&lf, sizeof(lf));
+        lf.lfHeight = -44;
+        lf.lfWeight = FW_BOLD;
+        StringCchCopyW(lf.lfFaceName, ARRAYSIZE(lf.lfFaceName), L"Microsoft YaHei UI");
+        g_status_font = CreateFontIndirectW(&lf);
+        SendMessageW(g_status, WM_SETFONT, (WPARAM)g_status_font, TRUE);
+
+        ZeroMemory(&lf, sizeof(lf));
+        lf.lfHeight = -18;
+        lf.lfWeight = FW_NORMAL;
+        StringCchCopyW(lf.lfFaceName, ARRAYSIZE(lf.lfFaceName), L"Microsoft YaHei UI");
+        g_tip_font = CreateFontIndirectW(&lf);
+        SendMessageW(g_info, WM_SETFONT, (WPARAM)g_tip_font, TRUE);
+        SendMessageW(g_tip, WM_SETFONT, (WPARAM)g_tip_font, TRUE);
+        SendMessageW(g_counter, WM_SETFONT, (WPARAM)g_tip_font, TRUE);
+    }
+#endif
 
     SendMessageW(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
     fill_ports();
+#ifndef SIMPLE_UI
     append_log(L"请选择串口后点击连接");
+#else
+    update_success_counter();
+#endif
 }
 
 static void stop_worker_if_needed(void) {
@@ -774,7 +947,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
         return 0;
 
     case WM_APP_STATUS:
+#ifdef SIMPLE_UI
+        apply_status_message((const WCHAR *)lparam);
+#else
         SetWindowTextW(g_status, (const WCHAR *)lparam);
+#endif
         HeapFree(GetProcessHeap(), 0, (void *)lparam);
         return 0;
 
@@ -783,6 +960,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
         return 0;
 
     case WM_APP_DONE:
+#ifdef SIMPLE_UI
+        ++g_success_count;
+        update_success_counter();
+        apply_status_message(L"升级完成");
+#endif
         append_log(L"当前设备升级完成");
         return 0;
 
@@ -793,10 +975,30 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
         }
         EnableWindow(g_download_button, TRUE);
         SetWindowTextW(g_status, L"升级失败");
+#ifdef SIMPLE_UI
+        apply_status_message(L"升级失败");
+#endif
         append_log((const WCHAR *)lparam);
+#ifndef SIMPLE_UI
         MessageBoxW(hwnd, (const WCHAR *)lparam, L"升级失败", MB_ICONERROR);
+#endif
         HeapFree(GetProcessHeap(), 0, (void *)lparam);
         return 0;
+
+#ifdef SIMPLE_UI
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)lparam == g_status) {
+            SetBkMode((HDC)wparam, TRANSPARENT);
+            SetTextColor((HDC)wparam, g_status_color);
+            return (LRESULT)GetStockObject(WHITE_BRUSH);
+        }
+        if ((HWND)lparam == g_tip || (HWND)lparam == g_counter || (HWND)lparam == g_info) {
+            SetBkMode((HDC)wparam, TRANSPARENT);
+            SetTextColor((HDC)wparam, RGB(90, 90, 90));
+            return (LRESULT)GetStockObject(WHITE_BRUSH);
+        }
+        break;
+#endif
 
     case WM_CLOSE:
         stop_worker_if_needed();
@@ -805,6 +1007,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM 
         return 0;
 
     case WM_DESTROY:
+#ifdef SIMPLE_UI
+        if (g_status_font) {
+            DeleteObject(g_status_font);
+            g_status_font = NULL;
+        }
+        if (g_tip_font) {
+            DeleteObject(g_tip_font);
+            g_tip_font = NULL;
+        }
+#endif
         PostQuitMessage(0);
         return 0;
 
@@ -833,7 +1045,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
     wc.hInstance = instance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+#ifdef SIMPLE_UI
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+#else
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+#endif
     wc.lpszClassName = L"ChargerUpdaterWindow";
     if (!RegisterClassW(&wc)) {
         return 1;
@@ -841,7 +1057,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previous, LPSTR command_line, i
 
     g_main = CreateWindowExW(0, wc.lpszClassName, APP_TITLE,
                              WS_OVERLAPPEDWINDOW,
+#ifdef SIMPLE_UI
+                             CW_USEDEFAULT, CW_USEDEFAULT, 720, 380,
+#else
                              CW_USEDEFAULT, CW_USEDEFAULT, 720, 460,
+#endif
                              NULL, NULL, instance, NULL);
     if (!g_main) {
         return 1;
