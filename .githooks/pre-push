@@ -1,0 +1,31 @@
+#!/bin/sh
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+[ -n "$REPO_ROOT" ] || exit 0
+
+PENDING_FILES="$REPO_ROOT/TODO.md $REPO_ROOT/TEST_PENDING.md"
+FOUND=0
+
+for PENDING_FILE in $PENDING_FILES; do
+    [ -f "$PENDING_FILE" ] || continue
+
+    if grep -q '^- \[ \]' "$PENDING_FILE"; then
+        if [ "$FOUND" -eq 0 ]; then
+            printf '%s\n' ''
+            printf '%s\n' '========================================'
+            printf '%s\n' 'WARNING: unfinished items found'
+            printf '%s\n' 'Please review the following list before push:'
+        fi
+
+        printf '%s\n' "File: $PENDING_FILE"
+        grep '^- \[ \]' "$PENDING_FILE"
+        FOUND=1
+    fi
+done
+
+if [ "$FOUND" -eq 1 ]; then
+    printf '%s\n' '========================================'
+    printf '%s\n' ''
+fi
+
+exit 0
