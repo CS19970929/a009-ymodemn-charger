@@ -2,7 +2,7 @@
 
 ## Pending items
 
-- [ ] item 1
+- [ ] 测试 
 - [ ] item 2
 - [ ] item 3
 
